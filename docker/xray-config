@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DATA_DIR="${XRAY_DATA_DIR:-/var/lib/xray}"
+USERS_DIR="${DATA_DIR}/users"
+STATE="${DATA_DIR}/server.json"
+CONFIG="${XRAY_CONFIG:-/etc/xray/config.json}"
+
+SNI="${SNI:-www.dropbox.com}"
+DEST="${DEST:-${SNI}:443}"
+XHTTP_PATH="${XHTTP_PATH:-/}"
+VLESS_PORT="${VLESS_PORT:-443}"
+DEFAULT_USER="${DEFAULT_USER:-default}"
+
+fatal() { echo "[ERROR] $*" >&2; exit 1; }
+
+[[ "${VLESS_PORT}" =~ ^[0-9]{1,5}$ ]] || fatal "VLESS_PORT должен быть числом"
+((10#${VLESS_PORT} >= 1 && 10#${VLESS_PORT} <= 65535)) || fatal "VLESS_PORT вне диапазона 1..65535"
+VLESS_PORT="$((10#${VLESS_PORT}))"
+[[ "${DEFAULT_USER}" =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || fatal "Некорректный DEFAULT_USER"
+[[ "${XHTTP_PATH}" =~ ^/[a-zA-Z0-9._~!/@%+=,-]*$ ]] || fatal "Некорректный XHTTP_PATH"
+[[ "${SNI}" =~ ^[a-zA-Z0-9._:-]+$ ]] || fatal "Некорректный SNI"
+[[ "${DEST}" =~ ^[^[:space:]]+:[0-9]+$ ]] || fatal "DEST должен иметь формат host:port"
+
+mkdir -p "${USERS_DIR}" "$(dirname "${CONFIG}")"
+chmod 700 "${DATA_DIR}" "${USERS_DIR}"
+
+if [[ -f "${STATE}" ]] && jq -e '
+    (.reality.private_key | type == "string" and length > 0) and
+    (.reality.public_key | type == "string" and length > 0)
+    ' "${STATE}" >/dev/null 2>&1; then
+    private_key="$(jq -r '.reality.private_key' "${STATE}")"
+else
+    key_output="$(xray x25519)"
+    private_key="$(sed -nE 's/^PrivateKey:[[:space:]]*(.+)$/\1/p' <<<"${key_output}" | head -n1)"
+fi
+
+[[ -n "${private_key:-}" ]] || fatal "Не удалось получить REALITY private key"
+key_output="$(xray x25519 -i "${private_key}")"
+public_key="$(sed -nE \
+    -e 's/^Password \(PublicKey\):[[:space:]]*(.+)$/\1/p' \
+    -e 's/^Password:[[:space:]]*(.+)$/\1/p' \
+    -e 's/^PublicKey:[[:space:]]*(.+)$/\1/p' \
+    <<<"${key_output}" | head -n1)"
+[[ -n "${public_key}" ]] || fatal "Не удалось получить REALITY public key"
+
+server_address="${SERVER_ADDRESS:-}"
+if [[ -z "${server_address}" && -f "${STATE}" ]]; then
+    server_address="$(jq -r '.address // empty' "${STATE}")"
+fi
+if [[ -z "${server_address}" ]]; then
+    server_address="$(curl -4fsS --max-time 5 https://icanhazip.com | tr -d '[:space:]')"
+fi
+[[ "${server_address}" =~ ^[a-zA-Z0-9._:-]+$ ]] || fatal "Некорректный SERVER_ADDRESS"
+
+state_tmp="$(mktemp "${DATA_DIR}/server.json.XXXXXX")"
+jq -n \
+    --arg address "${server_address}" \
+    --arg sni "${SNI}" \
+    --arg target "${DEST}" \
+    --arg path "${XHTTP_PATH}" \
+    --arg private_key "${private_key}" \
+    --arg public_key "${public_key}" \
+    --argjson port "${VLESS_PORT}" \
+    '{address: $address, vless: {port: $port, path: $path, mode: "auto"},
+      reality: {sni: $sni, target: $target, private_key: $private_key,
+                public_key: $public_key, fingerprint: "firefox"}}' >"${state_tmp}"
+chmod 600 "${state_tmp}"
+mv "${state_tmp}" "${STATE}"
+
+default_file="${USERS_DIR}/${DEFAULT_USER}.json"
+shopt -s nullglob
+existing_user_files=("${USERS_DIR}"/*.json)
+if ((${#existing_user_files[@]} == 0)); then
+    jq -n \
+        --arg name "${DEFAULT_USER}" \
+        --arg uuid "$(xray uuid)" \
+        --arg short_id "$(openssl rand -hex 8)" \
+        --arg created_at "$(date -Iseconds)" \
+        '{name: $name, uuid: $uuid, short_id: $short_id, created_at: $created_at}' >"${default_file}"
+    chmod 600 "${default_file}"
+fi
+
+user_files=("${USERS_DIR}"/*.json)
+if ! jq -se '
+    length > 0 and all(.[ ];
+      type == "object" and
+      (.name | type == "string" and test("^[a-zA-Z0-9_-]{1,64}$")) and
+      (.uuid | type == "string" and length > 0) and
+      (.short_id | type == "string" and test("^[0-9a-f]{16}$")) and
+      (.created_at | type == "string" and length > 0)) and
+    (map(.uuid) | length == (unique | length)) and
+    (map(.short_id) | length == (unique | length))
+    ' "${user_files[@]}" >/dev/null; then
+    fatal "Некорректные или повторяющиеся данные пользователей"
+fi
+
+clients="$(jq -sc 'map({id: .uuid, email: .name})' "${user_files[@]}")"
+short_ids="$(jq -sc 'map(.short_id)' "${user_files[@]}")"
+config_seed="$(mktemp "$(dirname "${CONFIG}")/.config.XXXXXX")"
+config_tmp="${config_seed}.json"
+mv "${config_seed}" "${config_tmp}"
+
+jq -n \
+    --argjson port "${VLESS_PORT}" \
+    --arg path "${XHTTP_PATH}" \
+    --arg target "${DEST}" \
+    --arg sni "${SNI}" \
+    --arg private_key "${private_key}" \
+    --argjson clients "${clients}" \
+    --argjson short_ids "${short_ids}" \
+    '{
+      log: {loglevel: "warning"},
+      routing: {domainStrategy: "AsIs", rules: [
+        {type: "field", domain: ["geosite:category-ads-all", "geosite:category-ru", "geosite:private"], outboundTag: "block"},
+        {type: "field", ip: ["geoip:cn", "geoip:ru", "geoip:private"], outboundTag: "block"},
+        {type: "field", domain: ["domain:vk.com", "domain:ok.ru", "domain:rutube.ru", "domain:telega.me", "domain:telega.info", "domain:ruwiki.ru", "domain:max.ru", "domain:mail.ru", "domain:yandex.ru", "domain:ya.ru", "domain:yandex.com", "domain:yastatic.net", "domain:yandex.net", "domain:yandex.cloud", "domain:dzen.ru", "domain:2ip.ru"], outboundTag: "block"}
+      ]},
+      inbounds: [{
+        tag: "vless-xhttp-reality", listen: "0.0.0.0", port: $port,
+        protocol: "vless", settings: {users: $clients, decryption: "none"},
+        streamSettings: {
+          network: "xhttp", xhttpSettings: {path: $path, mode: "auto"},
+          security: "reality", realitySettings: {show: false, target: $target,
+            serverNames: [$sni], privateKey: $private_key, shortIds: $short_ids}
+        },
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false, routeOnly: false}
+      }],
+      outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "block"}]
+    }' >"${config_tmp}"
+
+chmod 600 "${config_tmp}"
+if ! validation_output="$(xray run -test -config "${config_tmp}" 2>&1)"; then
+    rm -f "${config_tmp}"
+    printf '%s\n' "${validation_output}" >&2
+    fatal "Сгенерированный config.json не прошёл проверку Xray"
+fi
+mv "${config_tmp}" "${CONFIG}"

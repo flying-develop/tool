@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DATA_DIR="${XRAY_DATA_DIR:-/var/lib/xray}"
+USERS_DIR="${DATA_DIR}/users"
+STATE="${DATA_DIR}/server.json"
+
+fail() { echo "[ERROR] $*" >&2; exit 1; }
+valid_name() {
+    [[ "${1:-}" =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || fail "Имя: только a-z A-Z 0-9 _ -, максимум 64 символа"
+}
+user_file() { printf '%s/%s.json\n' "${USERS_DIR}" "$1"; }
+reload_xray() {
+    xray-config
+    if [[ -s /run/xray.pid ]]; then
+        kill -TERM "$(cat /run/xray.pid)"
+    fi
+}
+show_link() {
+    local name="$1" file address authority port path sni fp pbk uuid sid link
+    valid_name "${name}"
+    file="$(user_file "${name}")"
+    [[ -f "${file}" ]] || fail "Пользователь '${name}' не найден"
+    address="$(jq -r '.address' "${STATE}")"
+    authority="${address}"
+    [[ "${address}" != *:* || "${address}" == \[*\] ]] || authority="[${address}]"
+    port="$(jq -r '.vless.port' "${STATE}")"
+    path="$(jq -r '.vless.path | @uri' "${STATE}")"
+    sni="$(jq -r '.reality.sni | @uri' "${STATE}")"
+    fp="$(jq -r '.reality.fingerprint | @uri' "${STATE}")"
+    pbk="$(jq -r '.reality.public_key | @uri' "${STATE}")"
+    uuid="$(jq -r '.uuid' "${file}")"
+    sid="$(jq -r '.short_id' "${file}")"
+    link="vless://${uuid}@${authority}:${port}?security=reality&encryption=none&type=xhttp&path=${path}&mode=auto&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}#${name}"
+    printf '\n%s\n\nQR:\n' "${link}"
+    printf '%s\n' "${link}" | qrencode -t ansiutf8
+}
+
+case "${1:-help}" in
+    add)
+        valid_name "${2:-}"
+        file="$(user_file "$2")"
+        [[ ! -e "${file}" ]] || fail "Пользователь '$2' уже существует"
+        jq -n --arg name "$2" --arg uuid "$(xray uuid)" \
+            --arg short_id "$(openssl rand -hex 8)" --arg created_at "$(date -Iseconds)" \
+            '{name: $name, uuid: $uuid, short_id: $short_id, created_at: $created_at}' >"${file}"
+        chmod 600 "${file}"
+        if ! reload_xray; then rm -f "${file}"; fail "Не удалось добавить пользователя"; fi
+        show_link "$2"
+        ;;
+    del|delete|remove)
+        valid_name "${2:-}"
+        file="$(user_file "$2")"
+        [[ -f "${file}" ]] || fail "Пользователь '$2' не найден"
+        backup="$(mktemp)"
+        cp "${file}" "${backup}"
+        rm -f "${file}"
+        if ! reload_xray; then cp "${backup}" "${file}"; rm -f "${backup}"; fail "Не удалось удалить пользователя"; fi
+        rm -f "${backup}"
+        echo "[OK] Пользователь '$2' удалён"
+        ;;
+    list|ls)
+        shopt -s nullglob
+        files=("${USERS_DIR}"/*.json)
+        ((${#files[@]} > 0)) || { echo "Пользователей нет"; exit; }
+        printf '%-20s %-38s %-16s %-25s\n' NAME UUID SHORT_ID CREATED
+        for file in "${files[@]}"; do
+            jq -r '[.name, .uuid, .short_id, .created_at] | @tsv' "${file}" | \
+                awk -F '\t' '{printf "%-20s %-38s %-16s %-25s\n", $1, $2, $3, $4}'
+        done
+        ;;
+    json) valid_name "${2:-}"; jq . "$(user_file "$2")" ;;
+    sync) reload_xray; echo "[OK] config.json синхронизирован" ;;
+    status)
+        [[ -s /run/xray.pid ]] && kill -0 "$(cat /run/xray.pid)" && echo "Xray запущен (PID $(cat /run/xray.pid))" || fail "Xray не запущен"
+        ;;
+    logs) echo "Используйте: docker compose logs -f xray" ;;
+    help|-h|--help)
+        printf '%s\n' 'tool add <name>' 'tool del <name>' 'tool <name>' 'tool list' 'tool json <name>' 'tool sync' 'tool status'
+        ;;
+    *) show_link "$1" ;;
+esac

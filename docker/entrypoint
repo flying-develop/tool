@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="${XRAY_CONFIG:-/etc/xray/config.json}"
+
+if (($# > 0)); then
+    exec "$@"
+fi
+
+xray-config
+stopping=0
+xray_pid=""
+
+stop() {
+    stopping=1
+    [[ -z "${xray_pid}" ]] || kill -TERM "${xray_pid}" 2>/dev/null || true
+}
+trap stop TERM INT
+
+while ((stopping == 0)); do
+    xray run -config "${CONFIG}" &
+    xray_pid=$!
+    printf '%s\n' "${xray_pid}" >/run/xray.pid
+    set +e
+    wait "${xray_pid}"
+    status=$?
+    set -e
+    rm -f /run/xray.pid
+    xray_pid=""
+    ((stopping == 1)) && exit "${status}"
+    echo "[+] Перезапуск Xray после обновления конфигурации"
+    sleep 1
+done

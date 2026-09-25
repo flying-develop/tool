@@ -1,0 +1,21 @@
+services:
+  xray:
+    build:
+      context: .
+      args:
+        XRAY_VERSION: ${XRAY_VERSION:-v26.3.27}
+    restart: unless-stopped
+    environment:
+      DEFAULT_USER: ${DEFAULT_USER:-default}
+      DEST: ${DEST:-www.dropbox.com:443}
+      SERVER_ADDRESS: ${SERVER_ADDRESS:-}
+      SNI: ${SNI:-www.dropbox.com}
+      VLESS_PORT: ${VLESS_PORT:-443}
+      XHTTP_PATH: ${XHTTP_PATH:-/}
+    ports:
+      - "${VLESS_PORT:-443}:${VLESS_PORT:-443}/tcp"
+    volumes:
+      - xray-data:/var/lib/xray
+
+volumes:
+  xray-data:

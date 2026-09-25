@@ -118,7 +118,7 @@ jq -n \
       ]},
       inbounds: [{
         tag: "vless-xhttp-reality", listen: "0.0.0.0", port: $port,
-        protocol: "vless", settings: {users: $clients, decryption: "none"},
+        protocol: "vless", settings: {clients: $clients, decryption: "none"},
         streamSettings: {
           network: "xhttp", xhttpSettings: {path: $path, mode: "auto"},
           security: "reality", realitySettings: {show: false, target: $target,
